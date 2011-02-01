@@ -53,7 +53,7 @@ class YouTubeCacher
 	//
 	public static function static_constructor()
 	{
-		self::$allowed_request_headers = array('Host', 'Cookie');
+		self::$allowed_request_headers = array('Host', 'Referer', 'Range', 'Cookie');
 		self::$custom_request_headers = array('User-Agent' => 'YouTube Cache', 'X-Cache-Admin' => $GLOBALS['admin_email']);
 		self::$cached_headers = array('Content-Type', 'Content-Length', 'Last-Modified', 'Server');
 	}
@@ -207,6 +207,7 @@ class YouTubeCacher
 		//
 		// Send headers.
 		//
+		$hs = array();
 		while (!feof($fp)) {
 			if (($ln = fgets($fp)) === FALSE) {
 				$e = error_get_last();
@@ -215,8 +216,25 @@ class YouTubeCacher
 			else if (($ln = rtrim($ln)) == '') {
 				break;
 			}
-			header($ln);
-			$this->log("Cached header > client: [$ln].\n");
+			if (preg_match('/^([^:]+): *(.*)$/', $ln, $mo) === 0) {
+				fatal("Invalid cached header in [{$this->cache_filename}]: [{$ln}].");
+			}
+			$hs[$mo[1]] = $mo[2];
+		}
+		if (isset($this->client_request_headers['Range'])) {
+			$range = $this->client_request_headers['Range'];
+			if (preg_match('/bytes[=\s]+([0-9]+)/', $range, $mo) !== 0) {
+				$firstbyte = $mo[1];
+				$size = $hs['Content-Length'];
+				$lastbyte = $size - $firstbyte - 1;
+				$hs['Content-Range'] = "bytes $firstbyte-$lastbyte/$size";
+				$hs['Content-Length'] -= $firstbyte;
+				header('HTTP/1.0 206 Partial Content');
+			}
+		}
+		foreach ($hs as $n => $v) {
+			header("$n: $v");
+			$this->log("Cached header > client: [$n: $v].\n");
 		}
 		$this->send_dynamic_headers_to_client();
 
@@ -234,7 +252,7 @@ class YouTubeCacher
 			echo $data;
 		}
 		fclose($fp);
-		$this->syslog("Served URL from cache: [{$this->original_url}.");
+		$this->syslog("Served URL from cache.");
 		exit();
 	}
 
@@ -285,8 +303,9 @@ class YouTubeCacher
 		);
 		$this->server_fp = fopen($this->original_url, 'rb', FALSE, $c);
 		if ($this->server_fp === FALSE) {
-			$e = error_get_last();
-			fatal("Cannot open URL: [$this->original_url]: {$e['message']}.");
+			$e = error_get_last(); // includes the URL.
+			$this->syslog("Cannot open URL: {$e['message']}.");
+			exit();
 		}
 	}
 
@@ -316,6 +335,17 @@ class YouTubeCacher
 
 	public function send_reply_headers_to_client()
 	{
+		$hs = $this->server_reply_headers;
+		if (isset($hs['Content-Range'])) {
+			foreach (array(
+				'HTTP/1.0 206 Partial Content',
+				'Content-Range: ' . $hs['Content-Range']
+			) as $h) {
+				header($h);
+				$this->log("Range header > client: [$h].\n");
+			}
+		}
+
 		foreach ($this->server_reply_headers as $n => $v) {
 			if (in_array($n, self::$cached_headers)) {
 				header("$n: $v");
@@ -335,6 +365,11 @@ class YouTubeCacher
 	public function is_cachable()
 	{
 		$h = $this->server_reply_headers;
+
+		if (isset($h['Content-Range'])) {
+			$this->syslog("Uncachable: Content-Range header is present.");
+			return FALSE;
+		}
 
 		if (!isset($h['Content-Type'])) {
 			$this->syslog("No Content-Type header.");
@@ -434,7 +469,8 @@ class YouTubeCacher
 			$data = fread($this->server_fp, 131072);
 			if ($data === FALSE) {
 				$e = error_get_last();
-				fatal("Cannot read URL: [{$this->original_url}]: {$e['message']}.");
+				$this->syslog("Cannot read URL: {$e['message']}.");
+				exit();
 			}
 
 			// To client.
@@ -462,7 +498,6 @@ class YouTubeCacher
 		if ($this->cache_fp) {
 			fclose($this->cache_fp);
 			$this->cache_fp = null;
-			$this->syslog("Caching stopped.\n");
 		}
 	
 		if (file_exists($this->temp_cache_filename)) {
@@ -484,7 +519,10 @@ class YouTubeCacher
 	//
 	public function close_cache_file()
 	{
-		if (!$this->cache_fp) return;
+		if (!$this->cache_fp) {
+			$this->syslog("URL not cached.");
+			return;
+		}
 
 		$cl = $this->server_reply_headers['Content-Length'];
 		$sz = ftell($this->cache_fp) - $this->cache_header_size;
